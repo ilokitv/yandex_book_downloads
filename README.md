@@ -1,6 +1,6 @@
 # Скачивание книг с books.yandex.ru
 
-Скрипты для сохранения книг из [books.yandex.ru](https://books.yandex.ru/) в PDF. Пишу коротко и по делу — как запускать и что учитывать.
+Скрипты для сохранения книг из [books.yandex.ru](https://books.yandex.ru/) в PDF
 
 ## Установка
 
