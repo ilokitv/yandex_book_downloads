@@ -2,11 +2,14 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from playwright.async_api import async_playwright, Browser, Page
+from waterfox_adapter import WaterfoxConnector, WaterfoxBrowser, WaterfoxPage
 from urllib.parse import urlparse, parse_qs
 from urllib.request import urlretrieve
 import time
 from pypdf import PdfWriter, PdfReader
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 class YandexBookDownloader:
 
@@ -14,28 +17,22 @@ class YandexBookDownloader:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.session_state_file = Path(session_state_file)
-        self.browser: Browser = None
-        self.page: Page = None
+        self.browser: WaterfoxBrowser = None
+        self.page: WaterfoxPage = None
         self.playwright = None
         self.context = None
+        self.waterfox = None
 
     async def init_browser(self, headless: bool=False):
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=headless, args=['--disable-blink-features=AutomationControlled'])
-        context_kwargs = {'viewport': {'width': 1920, 'height': 1080}, 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        if self.session_state_file.exists():
-            context_kwargs['storage_state'] = str(self.session_state_file)
-            print(f'Загружаю сохраненную сессию: {self.session_state_file}')
-        self.context = await self.browser.new_context(**context_kwargs)
+        self.waterfox = await WaterfoxConnector().start()
+        self.playwright = self.waterfox
+        self.browser = WaterfoxBrowser(self.waterfox.driver)
+        self.context = await self.browser.new_context()
         self.page = await self.context.new_page()
+        print('✓ Подключен Waterfox с вашим обычным профилем.')
 
     async def save_session_state(self):
-        try:
-            if self.context:
-                await self.context.storage_state(path=str(self.session_state_file))
-                print(f'✓ Сессия сохранена: {self.session_state_file}')
-        except Exception as e:
-            print(f'⚠ Не удалось сохранить сессию: {e}')
+        print('✓ Авторизация уже сохранена в профиле Waterfox.')
 
     async def close_browser(self):
         try:
@@ -43,8 +40,8 @@ class YandexBookDownloader:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
+            if self.waterfox:
+                await self.waterfox.stop()
         except Exception:
             pass
 
@@ -110,7 +107,7 @@ class YandexBookDownloader:
             print('✓ Вы уже авторизованы')
             return True
         print('⚠ Требуется авторизация')
-        print('Пожалуйста, авторизуйтесь в открывшемся браузере.')
+        print('Пожалуйста, авторизуйтесь в открывшемся окне Waterfox.')
         print('После авторизации скрипт продолжит работу автоматически...')
         print('(Ожидание до 5 минут...)')
         start_time = time.time()
@@ -179,7 +176,7 @@ class YandexBookDownloader:
             print(f'⚠ Не удалось сохранить обложку: {e}')
 
     async def find_next_page_button(self):
-        next_page_selectors = ['.Pagination_pagination_forward__AENcl', 'div[class*="Pagination_pagination_forward"]', '[data-e2e="reader.nextPage"]', '[data-testid="reader-next-page"]', 'button[aria-label*="следующ"]', 'button[aria-label*="next" i]', 'button[title*="следующ"]', 'button[title*="next" i]', '[data-testid*="next"]', '[role="button"][aria-label*="следующ"]', 'a[aria-label*="следующ"]']
+        next_page_selectors = ['button[data-reader-page-direction="forward"]', 'button[aria-label*="Следующая страница"]', '.Pagination_pagination_forward__AENcl', 'div[class*="Pagination_pagination_forward"]', '[data-e2e="reader.nextPage"]', '[data-testid="reader-next-page"]', 'button[aria-label*="следующ"]', 'button[aria-label*="next" i]', 'button[title*="следующ"]', 'button[title*="next" i]', '[data-testid*="next"]', '[role="button"][aria-label*="следующ"]', 'a[aria-label*="следующ"]']
         for selector in next_page_selectors:
             try:
                 button = await self.page.query_selector(selector)
@@ -194,8 +191,7 @@ class YandexBookDownloader:
 
     async def get_page_content_hash(self) -> str:
         try:
-            content = await self.page.evaluate('\n                () => {\n                    const reader = document.querySelector(\'[class*="reader"], [class*="book-content"], [class*="page"]\');\n                    if (reader) {\n                        return reader.innerText || reader.textContent || \'\';\n                    }\n                    return document.body.innerText || document.body.textContent || \'\';\n                }\n            ')
-            return str(hash(content[:1000]))
+            return await self.page.screenshot_signature()
         except Exception:
             return ''
 
@@ -243,7 +239,7 @@ class YandexBookDownloader:
         try:
             text, slider_info = await self.page.evaluate('\n                () => {\n                    const footer = document.querySelector(\'[data-e2e="footer.progress"]\');\n                    const footerText = footer ? (footer.textContent || footer.innerText || \'\') : \'\';\n                    const slider = document.querySelector(\'[data-e2e="progress.slider"] input[type="range"]\');\n                    let sliderData = null;\n                    if (slider) {\n                        sliderData = {\n                            value: slider.value,\n                            min: slider.min || \'0\',\n                            max: slider.max || \'1000\'\n                        };\n                    }\n                    return [footerText, sliderData];\n                }\n            ')
             if text:
-                m = __import__('re').search('\\\\d+', text)
+                m = __import__('re').search(r'\d+', text)
                 if m:
                     return int(m.group(0))
             if slider_info and isinstance(slider_info, dict):
@@ -309,37 +305,20 @@ class YandexBookDownloader:
                 return (False, False)
             old_hash = await self.get_page_content_hash()
             old_url = self.page.url
-            viewport = self.page.viewport_size or {'width': 1920, 'height': 1080}
-            await self.page.mouse.move(int(viewport['width'] * 0.5), int(viewport['height'] * 0.5))
-            await asyncio.sleep(0.15)
-            clicked = False
-            exact_loc = self.page.locator('.Pagination_pagination_forward__AENcl').first
-            try:
-                if await exact_loc.count() > 0:
-                    await exact_loc.click(force=True, timeout=2000)
-                    clicked = True
-            except Exception:
-                pass
-            if not clicked:
-                generic_loc = self.page.locator('div[class*="Pagination_pagination_forward"]').first
-                try:
-                    if await generic_loc.count() > 0:
-                        await generic_loc.click(force=True, timeout=2000)
-                        clicked = True
-                except Exception:
-                    pass
-            if not clicked:
-                x = int(viewport['width'] * 0.92)
-                y = int(viewport['height'] * 0.5)
-                await self.page.mouse.click(x, y)
-                clicked = True
-            if not clicked:
+            old_progress = await self.get_progress_percent()
+            page_changed = False
+            await self.page.keyboard.press('ArrowRight')
+            for _ in range(20):
+                await asyncio.sleep(0.15)
+                new_hash = await self.get_page_content_hash()
+                new_url = self.page.url
+                new_progress = await self.get_progress_percent()
+                page_changed = old_hash != new_hash or old_url != new_url or old_progress != new_progress
+                if page_changed:
+                    break
+            if not page_changed:
+                print('Клавиша → не изменила страницу или прогресс; останавливаюсь, чтобы не сохранять дубли.')
                 return (False, False)
-            await self.wait_for_content_load(timeout=2.5)
-            await asyncio.sleep(1.5)
-            new_hash = await self.get_page_content_hash()
-            new_url = self.page.url
-            page_changed = old_hash != new_hash or old_url != new_url
             return (True, page_changed)
         except Exception as e:
             print(f'Ошибка при перелистывании: {e}')
@@ -460,7 +439,7 @@ class YandexBookDownloader:
                 print(f'\n=== Страница {page_num} ===')
                 print(f'Ожидание загрузки страницы {page_num}...')
                 await self.wait_for_content_load(timeout=2.5)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.25)
                 await self.close_app_promo()
                 print(f'Подготовка страницы {page_num} к сохранению...')
                 await self.page.evaluate('\n                    () => {\n                        window.scrollBy(0, 120);\n                        window.scrollTo(0, 0);\n                    }\n                ')
@@ -531,14 +510,14 @@ class YandexBookDownloader:
 
 async def main():
     if len(sys.argv) < 2:
-        print('Использование: python download_book.py <URL_книги> [имя_файла.pdf]')
+        print('Использование: py -3.12 download_book.py <URL_книги> [имя_файла.pdf]')
         print('Пример: python download_book.py https://books.yandex.ru/books/rN65jwOm?utm_place=post_slider')
         sys.exit(1)
     book_url = sys.argv[1]
     output_filename = sys.argv[2] if len(sys.argv) > 2 else None
     downloader = YandexBookDownloader()
     try:
-        print('Запуск браузера...')
+        print('Запуск Waterfox...')
         await downloader.init_browser(headless=False)
         await downloader.download_book(book_url, output_filename)
     except KeyboardInterrupt:

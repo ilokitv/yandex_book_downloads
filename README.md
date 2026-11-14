@@ -2,32 +2,30 @@
  
 Скрипты для сохранения книг из [books.yandex.ru](https://books.yandex.ru/) в PDF
 
-## Установка
+## Установка для Waterfox (Windows)
 
-1) Python 3.8+ (подойдёт и новее).  
-2) Зависимости:
-```bash
-python -m pip install -r requirements.txt
-# или
-py -m pip install -r requirements.txt
+1. Установите Python 3.12 и Waterfox.
+2. Положите папки `yandex_book_downloads` и `waterfox-selenium-chatgpt` рядом на Рабочем столе.
+3. В PowerShell откройте папку `yandex_book_downloads` и установите зависимости:
+
+```powershell
+py -3.12 -m pip install -r requirements.txt
 ```
-3) Браузер для Playwright:
-```bash
-python -m playwright install chromium
-```
+
+Скрипт подключается к обычному профилю Waterfox и использует сохранённую в нём авторизацию. Если браузер не запущен с Marionette, запускатель попробует штатно перезапустить его. Selenium подберёт GeckoDriver при запуске.
 
 ## Одиночное скачивание
 
-```bash
-python download_book.py <URL_книги> [имя_файла.pdf]
+```powershell
+py -3.12 download_book.py <URL_книги> [имя_файла.pdf]
 ```
-– открывается браузер, авторизуетесь (если нужно), книга сохраняется в `downloads`.
+Скрипт подключится к окну Waterfox. Если вход в Яндекс ещё не выполнен, авторизуйтесь в Waterfox; книга сохранится в `downloads`.
 
 Что делает скрипт:
-- подхватывает сохранённую сессию (`session_state.json`), чтобы не логиниться каждый раз;
+- использует обычный профиль Waterfox, поэтому сохраняется текущая сессия;
 - закрывает всплывашки (в т.ч. QR-предложение приложения);
 - перед сохранением убирает панели ридера, заголовок и нижний прогресс — в PDF попадает только контент;
-- сохраняет в горизонтальном A4 (две страницы на листе), скриншотом страницы браузера;
+- сохраняет каждую страницу из Waterfox в горизонтальный A4;
 - пытается выставить прогресс на начало книги, чтобы идти с первой страницы;
 - перелистывает по «стрелке» ридера (строго один шаг);
 - останавливается, когда процент чтения из `data-e2e="footer.progress"` перестаёт меняться 5 раз подряд при значении > 85%;
@@ -36,8 +34,8 @@ python download_book.py <URL_книги> [имя_файла.pdf]
 
 ## Пакетное скачивание по Excel
 
-```bash
-python batch_download_books.py books.xlsx
+```powershell
+py -3.12 batch_download_books.py books.xlsx
 ```
 Формат листа (без заголовков):
 - колонка A — номер (папка для книги в `downloads/<номер>`)
@@ -46,8 +44,7 @@ python batch_download_books.py books.xlsx
 - колонка D — автор (опционально)
 
 Заметки по пакетному режиму:
-- первый запуск — авторизуетесь в открывшемся окне, нажимаете Enter;  
-  сессия сохранится в `session_state.json` и дальше подхватывается автоматически;
+- если потребуется авторизация — войдите в открывшемся Waterfox и нажмите Enter; сессия останется в профиле браузера;
 - если главная `books.yandex.ru` долго грузится, скрипт просит нажать Enter — можно продолжать вручную;
 - после успешного скачивания каждая книга регистрируется в `downloads/COMPLETED.md` в формате:  
   `- <номер> — <название>`.
@@ -75,5 +72,6 @@ python batch_download_books.py books.xlsx
 
 ## Требования
 
-- Windows + Python 3.8+
-- Playwright + Chromium (`python -m playwright install chromium`)*** End Patch
+- Windows + Python 3.12
+- Waterfox и папка `waterfox-selenium-chatgpt` рядом с этим репозиторием
+- Selenium + GeckoDriver (Selenium подберёт драйвер при запуске)
