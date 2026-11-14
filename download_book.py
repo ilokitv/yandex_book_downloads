@@ -2,11 +2,13 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from playwright.async_api import async_playwright, Browser, Page
-from urllib.parse import urlparse, parse_qs
+from waterfox_adapter import WaterfoxConnector, WaterfoxBrowser, WaterfoxPage
 from urllib.request import urlretrieve
 import time
-from pypdf import PdfWriter, PdfReader
+from urllib.parse import urljoin, urlparse
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 class YandexBookDownloader:
 
@@ -14,28 +16,22 @@ class YandexBookDownloader:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.session_state_file = Path(session_state_file)
-        self.browser: Browser = None
-        self.page: Page = None
+        self.browser: WaterfoxBrowser = None
+        self.page: WaterfoxPage = None
         self.playwright = None
         self.context = None
+        self.waterfox = None
 
     async def init_browser(self, headless: bool=False):
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=headless, args=['--disable-blink-features=AutomationControlled'])
-        context_kwargs = {'viewport': {'width': 1920, 'height': 1080}, 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        if self.session_state_file.exists():
-            context_kwargs['storage_state'] = str(self.session_state_file)
-            print(f'Загружаю сохраненную сессию: {self.session_state_file}')
-        self.context = await self.browser.new_context(**context_kwargs)
+        self.waterfox = await WaterfoxConnector().start()
+        self.playwright = self.waterfox
+        self.browser = WaterfoxBrowser(self.waterfox.driver)
+        self.context = await self.browser.new_context()
         self.page = await self.context.new_page()
+        print('✓ Подключен Waterfox с вашим обычным профилем.')
 
     async def save_session_state(self):
-        try:
-            if self.context:
-                await self.context.storage_state(path=str(self.session_state_file))
-                print(f'✓ Сессия сохранена: {self.session_state_file}')
-        except Exception as e:
-            print(f'⚠ Не удалось сохранить сессию: {e}')
+        print('✓ Авторизация уже сохранена в профиле Waterfox.')
 
     async def close_browser(self):
         try:
@@ -43,8 +39,8 @@ class YandexBookDownloader:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
+            if self.waterfox:
+                await self.waterfox.stop()
         except Exception:
             pass
 
@@ -110,7 +106,7 @@ class YandexBookDownloader:
             print('✓ Вы уже авторизованы')
             return True
         print('⚠ Требуется авторизация')
-        print('Пожалуйста, авторизуйтесь в открывшемся браузере.')
+        print('Пожалуйста, авторизуйтесь в открывшемся окне Waterfox.')
         print('После авторизации скрипт продолжит работу автоматически...')
         print('(Ожидание до 5 минут...)')
         start_time = time.time()
@@ -179,7 +175,7 @@ class YandexBookDownloader:
             print(f'⚠ Не удалось сохранить обложку: {e}')
 
     async def find_next_page_button(self):
-        next_page_selectors = ['.Pagination_pagination_forward__AENcl', 'div[class*="Pagination_pagination_forward"]', '[data-e2e="reader.nextPage"]', '[data-testid="reader-next-page"]', 'button[aria-label*="следующ"]', 'button[aria-label*="next" i]', 'button[title*="следующ"]', 'button[title*="next" i]', '[data-testid*="next"]', '[role="button"][aria-label*="следующ"]', 'a[aria-label*="следующ"]']
+        next_page_selectors = ['button[data-reader-page-direction="forward"]', 'button[aria-label*="Следующая страница"]', '.Pagination_pagination_forward__AENcl', 'div[class*="Pagination_pagination_forward"]', '[data-e2e="reader.nextPage"]', '[data-testid="reader-next-page"]', 'button[aria-label*="следующ"]', 'button[aria-label*="next" i]', 'button[title*="следующ"]', 'button[title*="next" i]', '[data-testid*="next"]', '[role="button"][aria-label*="следующ"]', 'a[aria-label*="следующ"]']
         for selector in next_page_selectors:
             try:
                 button = await self.page.query_selector(selector)
@@ -194,10 +190,36 @@ class YandexBookDownloader:
 
     async def get_page_content_hash(self) -> str:
         try:
-            content = await self.page.evaluate('\n                () => {\n                    const reader = document.querySelector(\'[class*="reader"], [class*="book-content"], [class*="page"]\');\n                    if (reader) {\n                        return reader.innerText || reader.textContent || \'\';\n                    }\n                    return document.body.innerText || document.body.textContent || \'\';\n                }\n            ')
-            return str(hash(content[:1000]))
+            # Used only to detect a page turn; screenshots are never saved to disk.
+            return await self.page.screenshot_signature()
         except Exception:
             return ''
+
+    async def extract_page_content(self) -> dict:
+        """Read the current book page as native text and collect its images."""
+        return await self.page.evaluate('''
+            () => {
+                const containers = [...document.querySelectorAll('.section1.content-container')];
+                const roots = containers.length ? containers : [...document.querySelectorAll('[class*="content-container"]')];
+                const text = roots.map(el => (el.innerText || el.textContent || '').trim())
+                    .filter(Boolean).join('\\n\\n');
+                const images = roots.flatMap(root => [...root.querySelectorAll('img')].map(img => ({
+                    src: img.currentSrc || img.src || '',
+                    alt: img.alt || ''
+                }))).filter(img => img.src);
+                return {text, images};
+            }
+        ''')
+
+    def save_page_image(self, image_url: str, page_num: int, image_num: int, image_dir: Path) -> str:
+        image_url = urljoin(self.page.url, image_url)
+        suffix = Path(urlparse(image_url).path).suffix.lower()
+        if suffix not in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}:
+            suffix = '.png'
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / f'page_{page_num:04d}_image_{image_num:02d}{suffix}'
+        urlretrieve(image_url, str(image_path))
+        return image_path.as_posix()
 
     async def close_app_promo(self):
         try:
@@ -232,18 +254,11 @@ class YandexBookDownloader:
         except Exception:
             await asyncio.sleep(1)
 
-    async def hide_reader_ui_for_pdf(self):
-        try:
-            await self.page.evaluate('\n                () => {\n                    const styleId = \'yb-pdf-hide-ui\';\n                    let style = document.getElementById(styleId);\n                    if (!style) {\n                        style = document.createElement(\'style\');\n                        style.id = styleId;\n                        document.head.appendChild(style);\n                    }\n                    style.textContent = `\n                        /* Верхняя панель ридера и похожие элементы */\n                        [data-e2e="reader.header"],\n                        [data-e2e="header"],\n                        [class*="Header"],\n                        [class*="header"],\n                        [class*="TopBar"],\n                        [class*="toolbar"],\n                        [class*="AppPromo"],\n                        [data-e2e="app-promo"] {\n                            display: none !important;\n                            visibility: hidden !important;\n                            opacity: 0 !important;\n                            pointer-events: none !important;\n                        }\n\n                        /* Нижняя панель прогресса (прячем в PDF) */\n                        .Footer_footer__progress__jR_ru,\n                        [class*="Footer_footer__progress"],\n                        .ProgressBox_progress__r0uiE,\n                        [class*="ProgressBox_progress"],\n                        [data-e2e="progress.slider"] {\n                            display: none !important;\n                            visibility: hidden !important;\n                            opacity: 0 !important;\n                            pointer-events: none !important;\n                        }\n\n                        /* Убираем отступ сверху, который обычно остаётся после скрытия header */\n                        body, html {\n                            margin-top: 0 !important;\n                            padding-top: 0 !important;\n                        }\n                    `;\n                }\n            ')
-            await asyncio.sleep(0.2)
-        except Exception:
-            pass
-
     async def get_progress_percent(self) -> int:
         try:
             text, slider_info = await self.page.evaluate('\n                () => {\n                    const footer = document.querySelector(\'[data-e2e="footer.progress"]\');\n                    const footerText = footer ? (footer.textContent || footer.innerText || \'\') : \'\';\n                    const slider = document.querySelector(\'[data-e2e="progress.slider"] input[type="range"]\');\n                    let sliderData = null;\n                    if (slider) {\n                        sliderData = {\n                            value: slider.value,\n                            min: slider.min || \'0\',\n                            max: slider.max || \'1000\'\n                        };\n                    }\n                    return [footerText, sliderData];\n                }\n            ')
             if text:
-                m = __import__('re').search('\\\\d+', text)
+                m = __import__('re').search(r'\d+', text)
                 if m:
                     return int(m.group(0))
             if slider_info and isinstance(slider_info, dict):
@@ -309,37 +324,20 @@ class YandexBookDownloader:
                 return (False, False)
             old_hash = await self.get_page_content_hash()
             old_url = self.page.url
-            viewport = self.page.viewport_size or {'width': 1920, 'height': 1080}
-            await self.page.mouse.move(int(viewport['width'] * 0.5), int(viewport['height'] * 0.5))
-            await asyncio.sleep(0.15)
-            clicked = False
-            exact_loc = self.page.locator('.Pagination_pagination_forward__AENcl').first
-            try:
-                if await exact_loc.count() > 0:
-                    await exact_loc.click(force=True, timeout=2000)
-                    clicked = True
-            except Exception:
-                pass
-            if not clicked:
-                generic_loc = self.page.locator('div[class*="Pagination_pagination_forward"]').first
-                try:
-                    if await generic_loc.count() > 0:
-                        await generic_loc.click(force=True, timeout=2000)
-                        clicked = True
-                except Exception:
-                    pass
-            if not clicked:
-                x = int(viewport['width'] * 0.92)
-                y = int(viewport['height'] * 0.5)
-                await self.page.mouse.click(x, y)
-                clicked = True
-            if not clicked:
+            old_progress = await self.get_progress_percent()
+            page_changed = False
+            await self.page.keyboard.press('ArrowRight')
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                new_hash = await self.get_page_content_hash()
+                new_url = self.page.url
+                new_progress = await self.get_progress_percent()
+                page_changed = old_hash != new_hash or old_url != new_url or old_progress != new_progress
+                if page_changed:
+                    break
+            if not page_changed:
+                print('Клавиша → не изменила страницу или прогресс; останавливаюсь, чтобы не сохранять дубли.')
                 return (False, False)
-            await self.wait_for_content_load(timeout=2.5)
-            await asyncio.sleep(1.5)
-            new_hash = await self.get_page_content_hash()
-            new_url = self.page.url
-            page_changed = old_hash != new_hash or old_url != new_url
             return (True, page_changed)
         except Exception as e:
             print(f'Ошибка при перелистывании: {e}')
@@ -443,87 +441,93 @@ class YandexBookDownloader:
             await self.move_reader_to_start()
             if not output_filename:
                 book_id = await self.extract_book_id(book_url)
-                if book_id:
-                    output_filename = f'book_{book_id}.pdf'
-                else:
-                    output_filename = 'book.pdf'
+                output_filename = f'book_{book_id}.md' if book_id else 'book.md'
+            if Path(output_filename).suffix.lower() != '.md':
+                output_filename = str(Path(output_filename).with_suffix('.md'))
             output_path = self.output_dir / output_filename
-            temp_dir = self.output_dir / 'temp_pages'
-            temp_dir.mkdir(exist_ok=True)
-            page_files = []
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            images_dir = output_path.parent / 'images'
+            title = await self.page.evaluate('() => document.title')
+            markdown = [f'# {title or "Книга Яндекс"}', '']
+            cover_path = self.output_dir / 'cover.jpg'
+            if cover_path.exists():
+                cover_rel = os.path.relpath(cover_path, output_path.parent).replace(os.sep, '/')
+                markdown.extend([f'![Обложка]({cover_rel})', ''])
+
             page_num = 1
             max_pages = 1000
-            high_progress_count = 0
-            last_progress_value = -1
-            print('Начинаю сбор страниц книги...')
+            seen_page_texts = set()
+            seen_image_urls = set()
+            section_num = 0
+            empty_page_count = 0
+            print('Собираю текст книги и изображения в Markdown...')
             while page_num <= max_pages:
                 print(f'\n=== Страница {page_num} ===')
-                print(f'Ожидание загрузки страницы {page_num}...')
                 await self.wait_for_content_load(timeout=2.5)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.05)
                 await self.close_app_promo()
-                print(f'Подготовка страницы {page_num} к сохранению...')
-                await self.page.evaluate('\n                    () => {\n                        window.scrollBy(0, 120);\n                        window.scrollTo(0, 0);\n                    }\n                ')
-                await asyncio.sleep(0.5)
-                should_save = True
-                try:
-                    progress_value_early = await self.get_progress_percent()
-                    print(f'Текущий прогресс (до сохранения): {progress_value_early}%')
-                    if progress_value_early > 85:
-                        if progress_value_early == last_progress_value:
-                            high_progress_count += 1
-                            should_save = False
-                            if high_progress_count >= 4:
-                                print(f'Прогресс > 85% и не меняется ({progress_value_early}%) четыре раза подряд. Останавливаюсь на странице {page_num}.')
-                                break
-                        else:
-                            high_progress_count = 1
-                    else:
-                        high_progress_count = 0
-                    last_progress_value = progress_value_early
-                except Exception:
-                    should_save = True
-                await self.hide_reader_ui_for_pdf()
-                temp_page_path = temp_dir / f'page_{page_num:04d}.pdf'
-                if should_save:
-                    print(f'Сохранение страницы {page_num}...')
-                try:
-                    await self.page.pdf(path=str(temp_page_path), format='A4', landscape=True, scale=0.8, print_background=True, margin={'top': '0cm', 'right': '0cm', 'bottom': '0cm', 'left': '0cm'})
-                    if should_save:
-                        page_files.append(str(temp_page_path))
-                        print(f'✓ Страница {page_num} сохранена')
-                except Exception as e:
-                    print(f'Ошибка при сохранении страницы {page_num}: {e}')
+                content = await self.extract_page_content()
+                page_text = (content.get('text') or '').strip()
+                page_images = content.get('images') or []
+                for _ in range(8):
+                    if page_text or page_images:
+                        break
+                    await asyncio.sleep(0.1)
+                    content = await self.extract_page_content()
+                    page_text = (content.get('text') or '').strip()
+                    page_images = content.get('images') or []
+                if not page_text and not page_images:
+                    empty_page_count += 1
+                    print('Контент пока не появился; пробую следующую страницу.')
+                    if empty_page_count >= 20:
+                        print('20 пустых страниц подряд; останавливаюсь.')
+                        break
+                    success, _ = await self.turn_page()
+                    if not success:
+                        print('Достигнута последняя страница книги.')
+                        break
+                    page_num += 1
+                    continue
+                empty_page_count = 0
+                signature = page_text
+                is_new_text = bool(signature and signature not in seen_page_texts)
+                if is_new_text:
+                    seen_page_texts.add(signature)
+                    section_num += 1
+                    markdown.extend([f'## Фрагмент {section_num}', ''])
+                    markdown.extend([page_text, ''])
+                saved_images = 0
+                for image in page_images:
+                    try:
+                        image_url = urljoin(self.page.url, image['src'])
+                        if image_url in seen_image_urls:
+                            continue
+                        seen_image_urls.add(image_url)
+                        saved_images += 1
+                        image_path = self.save_page_image(image_url, page_num, saved_images, images_dir)
+                        image_rel = os.path.relpath(image_path, output_path.parent).replace(os.sep, '/')
+                        alt = (image.get('alt') or f'Иллюстрация {saved_images}').replace(']', r'\]')
+                        if not is_new_text and section_num == 0:
+                            markdown.extend(['## Иллюстрации', ''])
+                        markdown.extend([f'![{alt}]({image_rel})', ''])
+                        print(f'✓ Изображение сохранено: {image_rel}')
+                    except Exception as e:
+                        print(f'⚠ Не удалось скачать изображение страницы: {e}')
+                if is_new_text:
+                    print(f'✓ Новый текст добавлен ({len(page_text)} символов)')
+                else:
+                    print('Этот текст уже записан; продолжаю перелистывание.')
                 print(f'Перелистываю на страницу {page_num + 1}...')
                 success, _ = await self.turn_page()
                 if not success:
-                    print('Не удалось перелистнуть страницу. Считаю, что достигнута последняя страница.')
+                    print('Последняя страница книги.')
                     break
                 page_num += 1
-            print(f'\nОбъединяю {len(page_files)} страниц в один PDF...')
-            writer = PdfWriter()
-            for page_file in page_files:
-                try:
-                    if os.path.exists(page_file):
-                        reader = PdfReader(page_file)
-                        for page in reader.pages:
-                            writer.add_page(page)
-                except Exception as e:
-                    print(f'Ошибка при объединении {page_file}: {e}')
-            with open(output_path, 'wb') as output_file:
-                writer.write(output_file)
-            print('Удаляю временные файлы...')
-            for page_file in page_files:
-                try:
-                    if os.path.exists(page_file):
-                        os.remove(page_file)
-                except Exception as e:
-                    print(f'Не удалось удалить {page_file}: {e}')
-            try:
-                temp_dir.rmdir()
-            except Exception:
-                pass
-            print(f'✓ Книга успешно скачана: {output_path} ({len(page_files)} страниц)')
+
+            if len(seen_page_texts) == 0:
+                raise RuntimeError('Из ридера не удалось извлечь текст книги.')
+            output_path.write_text('\n'.join(markdown).rstrip() + '\n', encoding='utf-8')
+            print(f'✓ Книга сохранена как Markdown: {output_path} ({len(seen_page_texts)} уникальных текстовых фрагментов)')
             return str(output_path)
         except Exception as e:
             print(f'Ошибка при скачивании книги: {e}')
@@ -531,14 +535,14 @@ class YandexBookDownloader:
 
 async def main():
     if len(sys.argv) < 2:
-        print('Использование: python download_book.py <URL_книги> [имя_файла.pdf]')
+        print('Использование: py -3.12 download_book.py <URL_книги> [имя_файла.md]')
         print('Пример: python download_book.py https://books.yandex.ru/books/rN65jwOm?utm_place=post_slider')
         sys.exit(1)
     book_url = sys.argv[1]
     output_filename = sys.argv[2] if len(sys.argv) > 2 else None
     downloader = YandexBookDownloader()
     try:
-        print('Запуск браузера...')
+        print('Запуск Waterfox...')
         await downloader.init_browser(headless=False)
         await downloader.download_book(book_url, output_filename)
     except KeyboardInterrupt:
