@@ -179,18 +179,6 @@ class WaterfoxPage:
         from selenium.webdriver import ActionChains
         ActionChains(self.driver).send_keys(value).perform()
 
-    async def pdf(self, path, format="A4", landscape=True, scale=0.8,
-                  print_background=True, margin=None):
-        from io import BytesIO
-        from PIL import Image, ImageOps
-        page_size = (1754, 1240) if landscape else (1240, 1754)
-        screenshot = Image.open(BytesIO(self.driver.get_screenshot_as_png())).convert("RGB")
-        fit_size = (int(page_size[0] * scale), int(page_size[1] * scale))
-        screenshot = ImageOps.contain(screenshot, fit_size, method=Image.Resampling.LANCZOS)
-        page = Image.new("RGB", page_size, "white")
-        page.paste(screenshot, ((page_size[0] - screenshot.width) // 2,
-                                (page_size[1] - screenshot.height) // 2))
-        page.save(path, format="PDF", resolution=150.0)
 
 
 class WaterfoxContext:

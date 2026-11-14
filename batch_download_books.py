@@ -82,9 +82,9 @@ async def download_from_excel(excel_path: str):
             safe_title = sanitize_filename(title)
             safe_author = sanitize_filename(author)
             if safe_author and safe_title:
-                filename = f'{safe_author} - {safe_title}.pdf'
+                filename = f'{safe_author} - {safe_title}.md'
             elif safe_title:
-                filename = f'{safe_title}.pdf'
+                filename = f'{safe_title}.md'
             else:
                 filename = None
             print(f'\n[{idx + 1}/{total}] Скачиваю книгу:')
